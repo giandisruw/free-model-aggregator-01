@@ -1,61 +1,56 @@
-// free-model-aggregator-01: one server, two client wires, ten free providers.
+// free-model-aggregator-01 v2: one server, two client wires, ten free providers.
 //
 // The entry reads the brief (provider directory, sealed quality table, workload manifest),
-// probes each provider's catalog route, registers one catalog with the env, then serves the
-// env client's 20 requests, one at a time, each with the best free model that meets the
-// request's requirements, failing over when a provider refuses, and exits 0 when the env
-// says the workload is done.
+// builds its catalog from the brief alone -- no catalog probes, so registration costs
+// zero provider calls -- then serves the env client's 20 requests with a BAYESIAN
+// router (see lib/bayes.ts). The failure schedule cannot be planned in advance:
+// MAKEFUN_TRIAL_SEED is a decimal u64 derived from the instance's sha256, not the
+// 64-hex instance seed the kit's generator draws from, and the instance seed reaches
+// the entry nowhere -- not in the env, not in GET /instance, not in the brief -- so
+// the entry learns the schedule as the trial runs. What the public generator does
+// publish is the shape of the draw: call 1 to any provider never fails, each
+// provider fails on 1-2 scheduled ordinals from 2..budget-1, one provider is forced
+// to fail call 2, and one provider goes out from a uniform ordinal on. The router
+// holds the exact posterior over those hypotheses per provider and serves each
+// request with the candidate maximising rating - 250 * P(next call refuses).
+// A provider never called yet (next call 1, P = 0) is always a safe harbour.
 //
-// ROUTING (quality is 60% of the score): for each request the candidates are one per
-// provider — that provider's best free model meeting the requirements — ordered by the
-// quality table's rating, highest first. A provider's budget is per provider, never per
-// model, so a second model on a refused provider cannot rescue a request; the next
-// candidate is always another provider. A JSON-mode request on the OpenAI wire is only
-// routed to a wire that can carry response_format (openai or gemini): an anthropic-wire
-// provider echoes json_mode absent and would fail the echo check.
-//
-// FAILOVER: a refused call (402, 429, 5xx, unreachable) is retried once on the same
-// provider — the failure schedules are single calls, so the next call usually answers —
-// and then the request moves to the next candidate. A 400/401 is not retried: the same
-// call would answer the same way. A provider whose last two calls both refused rests
-// for a growing number of requests (2, then 4, then 8) before it gets one more chance:
-// two adjacent scheduled failures look exactly like a spent budget, so the rest is
-// never permanent, and a truly spent provider's rests grow until the trial ends.
+// FAILOVER: a refused call is retried once on the same provider while its next
+// call still looks likely to succeed (P < 0.5): a scheduled fail is an isolated
+// ordinal, so the next one usually answers and keeps the best rating; an outage
+// makes P jump towards 1 and the provider is left alone. After a failed retry the
+// request moves to the next candidate by the same utility, and a provider is never
+// tried twice for one request.
 //
 // WIRE FIDELITY: every upstream answer is buffered whole before anything is sent to the
 // client, so a failure mid-answer still fails over instead of leaving a truncated stream.
 // The answer's echo is checked against the client body before it is accepted (system
-// prompt, user text, tools in order, max_tokens, stop sequences, image, JSON mode): an
-// answer whose echo differs is treated as a failed call and the next candidate is tried.
-// Responses are translated back into the client's wire with the provider's text whole,
+// prompt, user text, tools in order, `max_tokens`, stop sequences, image, JSON mode);
+// an answer whose echo differs is treated as a failed call and the next candidate is
+// tried. Responses are translated back into the client's wire with the provider's text whole,
 // its usage counts as that wire reports them, and its stop reason mapped end_turn to
 // stop, max_tokens to length, tool_use to tool_calls and refusal to content_filter.
 //
-// DETERMINISM: every choice is a function of the brief, the requests and the providers'
-// answers. No wall clock and no unseeded randomness anywhere in a route: the poll timer
+// DETERMINISM: every choice is a function of the brief and the providers' answers.
+// No wall clock and no unseeded randomness anywhere in a route: the poll timer
 // and the register retry only decide when the process exits, never what it answers.
+// The live pass and its replay observe the same answers in the same order, so they
+// compute the same choices and leave the same state export.
 
 import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
   authHeaders,
-  buildCatalog,
-  capabilitiesOf,
   isRecord,
   joinBase,
-  meetsRequirements,
-  modelFree,
-  probeProvider,
-  ratingOfModel,
   readBrief,
   type CatalogReport,
   type Json,
-  type ProbedModel,
-  type Probe,
   type ProviderDirectoryEntry,
   type Requirement,
   type Wire,
 } from './lib/providers.ts';
+import { BayesTracker, bestModelFor, FAIL_PENALTY_MILLI, RETRY_P_FAIL_MAX } from './lib/bayes.ts';
 import {
   anthropicError,
   anthropicEventsFromGemini,
@@ -85,8 +80,6 @@ import {
 const PROTOCOL_VERSION = 1;
 /** How often GET /work is polled, in milliseconds. */
 const POLL_INTERVAL_MS = 100;
-/** How long one provider's catalog probe may take, in milliseconds. */
-const PROBE_TIMEOUT_MS = 5000;
 /** How long one provider call may take, in milliseconds. */
 const CALL_TIMEOUT_MS = 10000;
 /** The most bytes of one client request body this server reads. */
@@ -100,30 +93,16 @@ const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
 const brief = readBrief(PROMPT_FILE);
-let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
+/**
+ * The Bayesian failure tracker, built in start() once the brief is read.
+ * Null until then; serve() never runs before start() builds it.
+ */
+let bayes: BayesTracker | null = null;
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
 /** Provider calls made so far, by provider id, for the log only. */
 const callsMade = new Map<string, number>();
-/**
- * Providers resting for this trial: a provider whose last two calls both refused
- * rests for a growing number of requests (2, then 4, then 8) before it gets one more
- * chance. A single refusal never rests a provider: the failure schedules are single
- * calls, so the next call usually answers. Resting, never a permanent mark, because
- * two adjacent scheduled failures look exactly like a spent budget — and a provider
- * wrongly rested for good would take its best model away from every later request,
- * while a rested one only costs the requests it sits out, which its neighbours serve
- * at the same rating or one step down. A truly spent provider's rests grow until the
- * trial ends, so the wasted probes stay few.
- */
-const restUntil = new Map<string, number>();
-/** Rest level per provider: the next rest lasts 2^level requests. */
-const restLevel = new Map<string, number>();
-/** Consecutive refused calls per provider, reset by any answer. */
-const consecutiveFailures = new Map<string, number>();
-/** Requests served so far, counted at the start of each serve. */
-let requestsSeen = 0;
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -133,7 +112,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** A catalog built from the brief alone, when no env answers the probes (the `--list` fallback). */
+/** A catalog built from the brief alone: every directory provider, its free models from the quality table. */
 function catalogFromBrief(): CatalogReport {
   const providers: CatalogReport['providers'] = [];
   if (brief.ratings === null) return { providers };
@@ -149,67 +128,51 @@ function catalogFromBrief(): CatalogReport {
   return { providers };
 }
 
-/** Probe every provider and build the one catalog (the `--list` document and the register body). */
+/** Build the one catalog from the brief alone (the `--list` document and the register body). */
 async function load(): Promise<void> {
   if (brief.error !== null) log(brief.error);
-  if (ENV_URL !== '') {
-    probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
-    for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
-  }
-  catalog = buildCatalog(ENV_URL, probes, brief.ratings);
-  if (catalog.providers.length === 0 && brief.ratings !== null) catalog = catalogFromBrief();
+  catalog = catalogFromBrief();
 }
 
-const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-
-/** The free models across the providers that answered, each id once, in the brief's provider order. */
+/** The free models of the brief's quality table, each id once, in the brief's provider order. */
 function servedModels(): ServedModel[] {
   const out: ServedModel[] = [];
   const seen = new Set<string>();
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    for (const model of [...probe.models].sort(byId)) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      out.push({ id: model.id, provider: probe.provider.id, display_name: model.display_name });
+  if (brief.ratings === null) return out;
+  for (const provider of brief.directory.providers) {
+    const ids = brief.ratings.ratings
+      .filter((r) => r.provider === provider.id && r.free)
+      .map((r) => r.model)
+      .sort();
+    for (const id of ids) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id, provider: provider.id, display_name: id });
     }
   }
   return out;
 }
 
 interface Candidate {
-  probe: Probe;
   provider: ProviderDirectoryEntry;
-  model: ProbedModel;
+  model: string;
   rating: number;
 }
 
 /**
- * One candidate per provider: that provider's best free model meeting the requirements.
- * Ordered by rating, highest first, ties by provider id then model id. A JSON-mode request
- * on the OpenAI wire only considers wires that can carry response_format.
+ * One candidate per provider: that provider's best free model meeting the requirements,
+ * from the brief's quality table. Ordered by rating, highest first, ties by provider
+ * id then model id. A JSON-mode request on the OpenAI wire only considers wires that
+ * can carry response_format (bestModelFor enforces that).
  */
-function candidatesFor(requires: Requirement, jsonEcho: boolean): Candidate[] {
+function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic'): Candidate[] {
   const out: Candidate[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    if ((restUntil.get(probe.provider.id) ?? -1) > requestsSeen) continue;
-    if (jsonEcho && probe.provider.wire === 'anthropic') continue;
-    let best: Candidate | null = null;
-    for (const model of probe.models) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      const rating = row?.rating_milli ?? 0;
-      if (best === null || rating > best.rating || (rating === best.rating && model.id < best.model.id)) {
-        best = { probe, provider: probe.provider, model, rating };
-      }
-    }
-    if (best !== null) out.push(best);
+  if (brief.ratings === null) return out;
+  for (const provider of brief.directory.providers) {
+    const best = bestModelFor(brief.ratings.ratings, provider, requires, clientApi);
+    if (best !== null) out.push({ provider, model: best.model, rating: best.rating });
   }
-  out.sort((a, b) => b.rating - a.rating || (a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0) || (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0));
+  out.sort((a, b) => b.rating - a.rating || (a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0) || (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
   return out;
 }
 
@@ -589,7 +552,7 @@ async function callProvider(candidate: Candidate, clientApi: 'openai' | 'anthrop
   const headers: Record<string, string> = { 'content-type': 'application/json', ...authHeaders(provider.auth, provider.key) };
   if (provider.wire === 'openai') {
     url = `${base}/v1/chat/completions`;
-    upstreamBody = clientApi === 'openai' ? { ...body, model: model.id } : anthropicToOpenAI(body, model.id);
+    upstreamBody = clientApi === 'openai' ? { ...body, model } : anthropicToOpenAI(body, model);
     if (stream) {
       upstreamBody.stream = true;
       upstreamBody.stream_options = { include_usage: true };
@@ -598,14 +561,14 @@ async function callProvider(candidate: Candidate, clientApi: 'openai' | 'anthrop
   } else if (provider.wire === 'anthropic') {
     url = `${base}/v1/messages`;
     headers['anthropic-version'] = '2023-06-01';
-    upstreamBody = clientApi === 'anthropic' ? { ...body, model: model.id } : openAIToAnthropicRequest(body, model.id);
+    upstreamBody = clientApi === 'anthropic' ? { ...body, model } : openAIToAnthropicRequest(body, model);
     if (stream) {
       upstreamBody.stream = true;
       headers.accept = 'text/event-stream';
     }
   } else {
     const method = stream ? 'streamGenerateContent' : 'generateContent';
-    url = `${base}/v1beta/models/${encodeURIComponent(model.id)}:${method}${stream ? '?alt=sse' : ''}`;
+    url = `${base}/v1beta/models/${encodeURIComponent(model)}:${method}${stream ? '?alt=sse' : ''}`;
     upstreamBody = clientApi === 'openai' ? openAIToGeminiRequest(body) : anthropicToGeminiRequest(body);
     if (stream) headers.accept = 'text/event-stream';
   }
@@ -641,38 +604,45 @@ async function callProvider(candidate: Candidate, clientApi: 'openai' | 'anthrop
   };
 }
 
-/** Serve one client request with the best free model that answers, failing over as needed. */
+/** Serve one client request: the highest-utility candidate first, one retry on a refusal. */
 async function serve(clientApi: 'openai' | 'anthropic', body: Json, stream: boolean): Promise<UpstreamAnswer | null> {
   const requires = requirementsFor(body);
-  const jsonEcho = clientApi === 'openai' && isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
   const expected = expectedEcho(clientApi, body);
-  const candidates = candidatesFor(requires, jsonEcho);
-  requestsSeen += 1;
-  for (const candidate of candidates) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const result = await callProvider(candidate, clientApi, body, stream, expected);
-      if (result.ok) {
-        consecutiveFailures.set(candidate.provider.id, 0);
-        restLevel.set(candidate.provider.id, 0);
-        restUntil.delete(candidate.provider.id);
-        log(`served by ${candidate.provider.id}/${candidate.model.id} (rating ${candidate.rating})`);
-        return result;
+  if (bayes === null) return null;
+  const cands = candidatesFor(requires, clientApi);
+  const tried = new Set<string>();
+  for (;;) {
+    const remaining = cands.filter((c) => !tried.has(c.provider.id));
+    if (remaining.length === 0) return null;
+    remaining.sort(
+      (a, b) =>
+        bayes?.utility(b.provider.id, b.rating) - (bayes?.utility(a.provider.id, a.rating) ?? 0) ||
+        (a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0) ||
+        (a.model < b.model ? -1 : a.model > b.model ? 1 : 0),
+    );
+    const candidate = remaining[0] as Candidate;
+    tried.add(candidate.provider.id);
+    const result = await callProvider(candidate, clientApi, body, stream, expected);
+    bayes.observe(candidate.provider.id, result.ok);
+    if (result.ok) {
+      log(`served by ${candidate.provider.id}/${candidate.model} (rating ${candidate.rating})`);
+      return result;
+    }
+    log(`refused by ${candidate.provider.id}/${candidate.model}: ${result.detail}`);
+    // One retry on the same provider while its next call still looks likely to
+    // succeed: a scheduled fail is an isolated ordinal, so the next one usually
+    // answers and keeps the best rating. An outage makes pFail jump, and then
+    // the provider is left alone for this request.
+    if (bayes.pFail(candidate.provider.id) < RETRY_P_FAIL_MAX) {
+      const retry = await callProvider(candidate, clientApi, body, stream, expected);
+      bayes.observe(candidate.provider.id, retry.ok);
+      if (retry.ok) {
+        log(`served by ${candidate.provider.id}/${candidate.model} on retry (rating ${candidate.rating})`);
+        return retry;
       }
-      log(`refused by ${candidate.provider.id}/${candidate.model.id}: ${result.detail}`);
-      // A 400 or 401 would answer the same way again: move to the next provider at once.
-      if (result.status === 400 || result.status === 401) break;
-      const streak = (consecutiveFailures.get(candidate.provider.id) ?? 0) + 1;
-      consecutiveFailures.set(candidate.provider.id, streak);
-      if (streak >= 2) {
-        const level = (restLevel.get(candidate.provider.id) ?? 0) + 1;
-        restLevel.set(candidate.provider.id, level);
-        const rest = Math.min(1 << level, 8);
-        restUntil.set(candidate.provider.id, requestsSeen + rest);
-        log(`${candidate.provider.id} refused twice running: resting ${rest} requests`);
-      }
+      log(`refused again by ${candidate.provider.id}/${candidate.model}: ${retry.detail}`);
     }
   }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -723,7 +693,7 @@ function models(req: IncomingMessage, res: ServerResponse): void {
 
 /** Send one served answer back in the client's wire, streamed or not as it asked. */
 function answer(res: ServerResponse, clientApi: 'openai' | 'anthropic', stream: boolean, served: UpstreamAnswer): void {
-  const model = served.candidate.model.id;
+  const model = served.candidate.model;
   const wire = served.candidate.provider.wire;
   if (!stream) {
     if (clientApi === 'openai') {
@@ -859,6 +829,8 @@ function poll(server: Server): void {
 
 async function start(): Promise<void> {
   await load();
+  bayes = new BayesTracker(brief.directory.providers.map((p) => p.id));
+  log(`bayes tracker: ${brief.directory.providers.length} providers, fail penalty ${FAIL_PENALTY_MILLI} milli`);
   if (process.argv.includes('--list')) {
     // The same document the register body carries, byte for byte: print the one built object and stop
     // before any server starts. A process whose stdout is not flushed loses the tail, so wait for it.
